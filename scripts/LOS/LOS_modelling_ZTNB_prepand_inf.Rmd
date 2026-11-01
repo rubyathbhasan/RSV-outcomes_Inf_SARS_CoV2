@@ -283,6 +283,24 @@ deff_robust <- 1 + (m_adj - 1) * rho
 deff_robust
 
 #apparently will not need robust clustered SE as deff is 1.02
+
+# Load glmmTMB for zero-truncated mixed-effects modeling
+pacman::p_load(glmmTMB, performance)
+
+# Fit the ZTNB null model with a random intercept for patient ID (lopnr)
+null_model_ztnb <- glmmTMB(days_of_stay ~ 1 + (1 | lopnr), 
+                           family = truncated_nbinom2(link = "log"), 
+                           data = std_cc1)
+
+# Extract the ICC
+rho <- performance::icc(null_model_ztnb)$ICC_adjusted
+
+# Calculate the cluster sizes and Design Effect
+cluster_sizes <- std_cc1 %>% count(lopnr) %>% pull(n)
+m_adj <- sum(cluster_sizes^2) / sum(cluster_sizes)
+deff_robust <- 1 + (m_adj - 1) * rho
+
+print(paste("Design Effect:", round(deff_robust, 4)))
 ```
 # Additional code: Robust clustered SE: 
 ```{r, eval = FALSE}
