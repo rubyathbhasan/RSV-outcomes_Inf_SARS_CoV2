@@ -1,0 +1,315 @@
+---
+title: "Length of Stay modeling, Pandemic period"
+author: "Rubyath Binte Hasan"
+date: '2026-06-20'
+output: 
+  html_document:
+    toc: TRUE
+    toc_depth: 3
+    toc_float: TRUE
+    number_sections: TRUE
+---
+```{r}
+rm(list=ls())
+pacman::p_load(dplyr, readr, data.table, janitor, car, splines, VGAM, sandwich, lmtest, marginaleffects, gtsummary, ggplot2)
+print("RQ: Among adults, were there differences in Length of Stay of RSV, compared to SARS-Cov-2 and Influenza hospitalization episodes with these infections?")
+```
+# Study population:
+```{r}
+setwd('C:/Data/Shared Folder/People/Rubyath/Data/Working files/Intermediate data/Period 2')
+std_cc2 <- read_csv2("std_cc2_co_cov.csv")
+#checking the % of repeated patients to account for multiple episodes from same patient
+#repetition around 5% or below -> robust clustered SE, GEE will be a overkill
+repeat_pts <- get_dupes(std_cc2, lopnr)
+std_cc2 %>% summarise(pct_distinct = (n_distinct(repeat_pts$lopnr))/ (n_distinct(std_cc2$lopnr)) * 100)
+```
+# A priori setup:
+```{r}
+#Exposure: organism_inf_new -> Influenza A/B (reference group), RSV, SARS-CoV-2
+#Outcome: days_of_stay
+#confounders/covariates: age_year, sex, education_level_recoded, mig_background, cci_cat, bac_coinf
+#interaction: virus*bac_coinf, virus*age
+#confounder and interactions are conceptualized a priori
+```
+# Data integrity and baseline checks:
+```{r}
+#checking missing data (covariates) for the need of imputation
+colSums(is.na(std_cc2))
+#categorizing CCI data as will be used modeled as categorical variable 
+std_cc2 <- std_cc2 %>% mutate(cci_cat = factor(case_when(cci_score <= 1 ~ "0-1", cci_score >= 2 & cci_score <= 4 ~ "2-4", cci_score >= 5 ~ ">=5", TRUE ~ NA_character_)))
+View(std_cc2)
+
+#categorical variables are factor and set reference group
+#continuous variables are numeric
+std_cc2$organism_inf_new <- relevel(factor(std_cc2$organism_inf_new), ref = "SARS-CoV-2")
+std_cc2$cci_cat <- relevel(factor(std_cc2$cci_cat), ref = "0-1")
+std_cc2$bac_coinf <- relevel(factor(std_cc2$bac_coinf), ref = "No")
+std_cc2$age_group <- relevel(factor(std_cc2$age_group), ref = "18-49 years")
+std_cc2$sex <- relevel(factor(std_cc2$sex), ref = "K")
+std_cc2$education_level_recoded <- relevel(factor(std_cc2$education_level_recoded), ref = "Primary")
+std_cc2$mig_background <- relevel(factor(std_cc2$mig_background), ref = "Swedish")
+
+std_cc2$age_year <- as.numeric(std_cc2$age_year)
+class(std_cc2$days_of_stay)
+std_cc2$days_of_stay <- as.numeric(std_cc2$days_of_stay)
+
+#verifying days_of_stay is non-negative count data, should be integer/numeric without decimals
+summary(std_cc2$days_of_stay)
+#minimum value 1 and right-skewed tail
+hist(std_cc2$days_of_stay, breaks = 50, main = "Distribution of Length of Stay", xlab = "Days", col = "blue")
+
+#multicoliniarity checking
+#to remove any covariates/confounder with a GVIF^2 > 5
+baseline_poisson <- glm(days_of_stay ~ organism_inf_new + age_year + sex + education_level_recoded + mig_background + cci_cat + bac_coinf, data = std_cc2, family = "poisson")
+baseline_poisson_ag <- glm(days_of_stay ~ organism_inf_new + age_group + sex + education_level_recoded + mig_background + cci_cat + bac_coinf, data = std_cc2, family = "poisson")
+vif(baseline_poisson)
+vif(baseline_poisson_ag)
+rm(baseline_poisson)
+rm(baseline_poisson_ag)
+```
+# Building the inference model:
+```{r}
+#zero truncated negative binomial, as count data with no zero
+#Model 0, empty model
+cc2_ztnb_empty <- vglm(days_of_stay ~ organism_inf_new, family = posnegbinomial(), data = std_cc2)
+
+#Model 1, adjusting for age (as cont) and sex
+cc2_ztnb_base <- vglm(days_of_stay ~ organism_inf_new + age_year + sex, family = posnegbinomial(), data = std_cc2)
+#Model 2, full adjustment, age as cont
+cc2_ztnb_full <- vglm(days_of_stay ~ organism_inf_new + age_year + sex + education_level_recoded + mig_background + cci_cat + bac_coinf, family = posnegbinomial(zero = NULL), data = std_cc2)
+
+#age as group
+#base model
+cc2_ztnb_base_ag <- vglm(days_of_stay ~ organism_inf_new + age_group + sex, family = posnegbinomial(), data = std_cc2)
+#full model
+cc2_ztnb_full_ag <- vglm(days_of_stay ~ organism_inf_new + age_group + sex + education_level_recoded + mig_background + cci_cat + bac_coinf, family = posnegbinomial(zero = NULL), data = std_cc2)
+
+#Models with full adjustment with splines and interaction
+#virus and bac_infection, age spline, age group interaction didn't work, as vglm() only handles full-rank models (currently) -> one cell was zero
+#model with 3 splines
+cc2_ztnb_advanced <- vglm(days_of_stay ~ organism_inf_new + ns(age_year, 3) + sex + education_level_recoded + mig_background + cci_cat + bac_coinf, family = posnegbinomial(zero = NULL), data = std_cc2)
+
+#model with 4 splines
+cc2_ztnb_advanced2 <- vglm(days_of_stay ~ organism_inf_new + ns(age_year, 4) + sex + education_level_recoded + mig_background + cci_cat + bac_coinf, family = posnegbinomial(zero = NULL), data = std_cc2)
+```
+# Model comparison, relative fit:
+```{r}
+#loglik gets lower and p < 0.05 significant
+#optional, as confounders are a priori
+#VGAM::lrtest(cc2_ztnb_base, cc2_ztnb_full)
+#VGAM::lrtest(cc2_ztnb_base_ag, cc2_ztnb_full_ag)
+
+#checking AIC
+#lowest AIC and BIC, cons BIC may penalize complex model
+c(Full = AIC(cc2_ztnb_full), Full_ag = AIC(cc2_ztnb_full_ag), Advanced = AIC(cc2_ztnb_advanced), Advanced2 = AIC(cc2_ztnb_advanced2))
+#c(Full = BIC(cc2_ztnb_full), Full_ag = BIC(cc2_ztnb_full_ag), Advanced = BIC(cc2_ztnb_advanced), Advanced2 = BIC(cc2_ztnb_advanced2))
+
+rm(cc2_ztnb_base)
+rm(cc2_ztnb_base_ag)
+rm(cc2_ztnb_full)
+rm(cc2_ztnb_full_ag)
+rm(cc2_ztnb_advanced)
+```
+# Validating assumptions:
+```{r}
+#overdispersion
+mean_days_of_stay <- mean(std_cc2$days_of_stay)
+var_days_of_stay <- var(std_cc2$days_of_stay)
+vmr <- var_days_of_stay/mean_days_of_stay
+print(vmr)
+
+#visualizing the non-linear spline
+#plot_predictions(cc2_ztnb_advanced2, condition = "age_year") + ggplot2::labs(title = "Predicted LOS by Age", subtitle = "Modelled as continuous", y = "Expected LOS", x = "Age") + ggplot2::theme_minimal()
+#modelled_age <- model.frame(cc2_ztnb_full)$age_year
+#supposed to produce a smooth exp curve
+
+#checking log-link linearity
+modelled_age <- std_cc2$age_year
+raw_residuals <- resid(cc2_ztnb_advanced2, type = "pearson")
+vgam_residual_mean <- raw_residuals[,1]
+plot(modelled_age, vgam_residual_mean, main = "Pearson residuals vs. Age, ztnb model", ylab = "Residuals(mean equation)", xlab = "Age", col = "blue", pch = 16, cex = 0.6)
+abline(h = 0, lty = 2, col = "red")
+lines(lowess(modelled_age, vgam_residual_mean), col = "black", lwd = 2)
+```
+# Post diagnostic
+```{r}
+#Note: Pearson residual struggles with discrete data
+#visual residual check
+plot(vgam_residual_mean, main = "Pearson residuals, ztnb model", ylab = "Residuals(mean equation)", xlab = "obs", col = "pink", pch = 16, cex = 0.6)
+abline(h = 0, lty = 2, col = "green")
+
+#Post-diagnostic: calculating sum of squared pearson residuals
+sum_sq_pearson <- sum(vgam_residual_mean^2)
+df_res <- df.residual(cc2_ztnb_advanced2)
+dispersion_stat <- sum_sq_pearson / df_res
+print(dispersion_stat) 
+#after sensitivity test by removing 99th quantile, dispersion stat reduces, possibly the outliers are responsible
+summary(cc2_ztnb_advanced2)
+
+#Post-diagnostic: Residuals vs. fitted values
+fitted_vals <- fitted(cc2_ztnb_advanced2)
+pearson_res <- resid(cc2_ztnb_advanced2, type = "pearson")[,1]
+plot(fitted_vals, pearson_res, xlab = "Fitted values (Predicted counts)", ylab = "Pearson Residuals", main = "Residuals vs Fitted values", pch = 20, col = rgb(0, 0, 0, 0.4))
+abline(h = 0, lty = 2, col = "red")
+lines(loess.smooth(fitted_vals, pearson_res), col = "blue", lwd = 2)
+
+#Binning the fitted value
+fitted_vals <- fitted(cc2_ztnb_advanced2)[,1]
+pearson_res <- resid(cc2_ztnb_advanced2, type = "pearson")[,1]
+diag_data <- data.frame(fitted = fitted_vals, resid = pearson_res)
+diag_data$broken <- cut(diag_data$fitted, breaks = hist(diag_data$fitted, plot = FALSE)$breaks)
+ggplot(diag_data, aes(x = broken, y = resid)) + geom_boxplot(outlier.alpha = 0) + geom_jitter(width = 0.2, alpha = 0.25, color = "grey") + geom_hline(yintercept = 0, linetype = "dashed", color = "red") + labs(title = "Variance across binned fitted values", x = "Fitted value bins", y = "Pearson residuals") + theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+# Comparing with zt poisson
+```{r}
+cc2_ztp_advanced <- vglm(days_of_stay ~ organism_inf_new + ns(age_year, 4) + sex + education_level_recoded + mig_background + cci_cat + bac_coinf, family = pospoisson(), data = std_cc2)
+c(ztnb = AIC(cc2_ztnb_advanced2), ztp = AIC(cc2_ztp_advanced))
+#ztp AIC is very high, checking residuals
+
+raw_residuals_p <- resid(cc2_ztp_advanced, type = "pearson")
+vgam_residual_mean_p <- raw_residuals_p[,1]
+plot(modelled_age, vgam_residual_mean_p, main = "Pearson residuals vs. Age, ztp model", ylab = "Residuals(mean equation)", xlab = "Age", col = "blue", pch = 16, cex = 0.6)
+abline(h = 0, lty = 2, col = "red")
+lines(lowess(modelled_age, vgam_residual_mean), col = "black", lwd = 2)
+
+plot(vgam_residual_mean_p, main = "Pearson residuals, ztp model", ylab = "Residuals(mean equation)", xlab = "obs", col = "pink", pch = 16, cex = 0.6)
+abline(h = 0, lty = 2, col = "green")
+#residuals deviation spread up to 60 for poisson, worst than ztnb, continuing with ztnb
+sum_sq_pearson <- sum(vgam_residual_mean_p^2)
+df_res <- df.residual(cc2_ztp_advanced)
+dispersion_stat <- sum_sq_pearson / df_res
+print(dispersion_stat) 
+rm(cc2_ztp_advanced)
+
+#could not do residual vs. fitted and Q-Q with rquantile
+#rq_residuals <- resid(cc2_ztnb_advanced, type = "rquantile")
+#head(rq_residuals) is null
+```
+# Results:
+```{r} 
+#Calculating IRR
+irr_estimates_emp <- exp(coef(cc2_ztnb_empty))
+irr_confints_emp <- exp(confint(cc2_ztnb_empty))
+
+print(irr_estimates_emp)
+print(irr_confints_emp)
+
+irr_estimates <- exp(coef(cc2_ztnb_advanced2))
+irr_confints <- exp(confint(cc2_ztnb_advanced2))
+
+print(irr_estimates)
+print(irr_confints)
+
+#Absolute risk (Average Marginal Effects), did not work as package does not support ztnb.
+#may be will do manually, and bootstrap
+#absolute_diff_days <- avg_comparisons(cc2_ztnb_advanced2, variables = "organism_inf_new", type = "response")
+#summary(absolute_diff_days)
+```
+# Robust SE calculation
+```{r}
+B <- 500
+num_coefs <- length(coef(cc2_ztnb_advanced2))
+boot_coefs <- matrix(NA, nrow = B, ncol = num_coefs)
+colnames(boot_coefs) <- names(coef(cc2_ztnb_advanced2))
+
+set.seed(235)
+cat("Starting bootstrap...\n")
+for(i in 1:B) {
+  boot_data <- std_cc2[sample(nrow(std_cc2), replace = TRUE), ]
+  tryCatch({boot_model <- vglm(days_of_stay ~ organism_inf_new + ns(age_year, 4) + sex + education_level_recoded + mig_background + cci_cat + bac_coinf, family = posnegbinomial(zero = NULL), data = boot_data)
+  if(isTRUE(as.numeric(boot_model@iter) < 30)) {
+  boot_coefs[i,] <- coef(boot_model)
+  }
+  }, error = function(e) {
+})
+  if(i %% 100 == 0) cat("Completed iteration:", i, "of", B, "\n")
+}
+
+successful_conv <- sum(!is.na(boot_coefs[, 1]))
+cat("\nBootstrap completed. Successful convergences:", successful_conv, "out of", B, "\n\n")
+
+robust_se <- apply(boot_coefs, 2, sd, na.rm = TRUE)
+
+results <- data.frame(Estimate = coef(cc2_ztnb_advanced2), Robust_SE = robust_se, z_value = coef(cc2_ztnb_advanced2)/robust_se)
+results$p_value <- 2 * (1-pnorm(abs(results$z_value)))
+results$CI_lower <- results$Estimate - (qnorm(0.975) * robust_se)
+results$CI_upper <- results$Estimate + (qnorm(0.975) * robust_se)
+
+results$IRR <- exp(results$Estimate)
+results$CI_lower_exp <- exp(results$CI_lower)
+results$CI_upper_exp <- exp(results$CI_upper)
+
+round(results, 4)
+```
+# Sensitivity test: 1 (removing 99th quantile)
+```{r, eval = FALSE}
+cutoff <- quantile(std_cc2$days_of_stay, 0.99)
+reduced_std_cc2 <- subset(std_cc2, days_of_stay <= cutoff)
+cc2_ztnb_advanced3 <- vglm(days_of_stay ~ organism_inf_new + ns(age_year, 4) + sex*organism_inf_new + education_level_recoded + mig_background + cci_cat + bac_coinf, family = posnegbinomial(zero = NULL), data = reduced_std_cc2)
+c(Advanced2 = AIC(cc2_ztnb_advanced2), Advanced3 = AIC(cc2_ztnb_advanced3))
+
+#Post-diagnostic: calculating sum of squared pearson residuals
+raw_residuals <- resid(cc2_ztnb_advanced3, type = "pearson")
+vgam_residual_mean <- raw_residuals[,1]
+sum_sq_pearson <- sum(vgam_residual_mean^2)
+df_res <- df.residual(cc2_ztnb_advanced3)
+dispersion_stat <- sum_sq_pearson / df_res
+print(dispersion_stat) 
+
+#Variance across binned fitted value
+fitted_vals <- fitted(cc2_ztnb_advanced3)[,1]
+pearson_res <- resid(cc2_ztnb_advanced3, type = "pearson")[,1]
+diag_data <- data.frame(fitted = fitted_vals, resid = pearson_res)
+diag_data$broken <- cut(diag_data$fitted, breaks = hist(diag_data$fitted, plot = FALSE)$breaks)
+ggplot(diag_data, aes(x = broken, y = resid)) + geom_boxplot(outlier.alpha = 0) + geom_jitter(width = 0.2, alpha = 0.25, color = "grey") + geom_hline(yintercept = 0, linetype = "dashed", color = "red") + labs(title = "Variance across binned fitted values", x = "Fitted value bins", y = "Pearson residuals") + theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+irr_estimates <- exp(coef(cc2_ztnb_advanced3))
+irr_confints <- exp(confint(cc2_ztnb_advanced3))
+print(irr_estimates)
+print(irr_confints)
+```
+#calculating design effect
+```{r}
+#bootstrapping of Robust Cluster SE had converegnce issues, so checking how if clustering is really making any big difference
+#pacman::p_load(lme4, performance)
+#m <- nrow(std_cc2)/length(unique(std_cc2$lopnr))
+#null_model <- lmer(days_of_stay ~ 1 + (1 | lopnr), data = std_cc2)
+#rho <- icc(null_model)$ICC_adjusted
+#deff <- 1 + (m-1)*rho
+#apparently will not need robust clustered SE as deff is zero
+```
+# Additional code: Robust clustered SE: 
+```{r}
+#coeftest didn't work, did bootstrapping, no success, probably becasue of low clustering
+#will do a sensitivity check by removing the multiple visits
+#extracted coefficients
+#cc2_coefs <- coef(cc2_ztnb_advanced2)
+#unique_patients <- unique(std_cc2$lopnr)
+
+#bootstrap iterations
+#B <- 100
+#coef_matrix <- matrix(NA, nrow = B, ncol = length(cc2_coefs))
+#colnames(coef_matrix) <- names(cc2_coefs)
+
+#cluster bootstrap loop
+#set.seed(314)
+#cat("Starting bootstrap. Total iterations:", B, "\n")
+#for (i in 1:B){
+#  sampled_ids <- sample(unique_patients, size = length(unique_patients), replace = TRUE)
+#  boot_data_list <- lapply(sampled_ids, function(id){std_cc2[std_cc2$lopnr == id,]
+#    })
+#boot_data <- do.call(rbind, boot_data_list) 
+#tryCatch({boot_model <- vglm(days_of_stay~organism_inf_new + nr(age_year, 4) + sex + education_level_recoded + mig_background + cci_cat + bac_coinf, family = posnegbinomial(zero = NULL), data = boot_data); coef_matrix[i,] <- coef(boot_model)}, error = function(e){})
+#if(i %% 10 == 0 || i == B){cat("Completed iteration:", i, "\n")}}
+#successful_runs <- sum(!is.na(coef_matrix[,1])) 
+#cat("\nTotal successful convergences:", successful_runs, "out of", B, "\n")
+
+#boot_se <- apply(coef_matrix, 2, sd, na.rm = TRUE)
+#z_values <- cc2_coefs/boot_se
+#p_values <- 2*(1-pnorm(abs(z_values)))
+#ci_lower_raw <- cc2_coefs - (1.96*boot_se)
+#ci_upper_raw <- cc2_coefs + (1.96*boot_se)
+#irr_estimates_bs <- exp(cc2_coefs)
+#irr_ci_lower <- exp(ci_lower_raw)
+#irr_ci_upper <- exp(ci_upper_raw)
+```

@@ -1,0 +1,75 @@
+---
+title: "Background characteristic_study poulation"
+author: "Rubyath Binte Hasan"
+date: "2026-07-02"
+output: 
+  html_document:
+    toc: TRUE
+    toc_depth: 3
+    toc_float: TRUE
+    number_sections: TRUE
+---
+# Reading the files and setting up
+```{r}
+rm(list=ls())
+pacman::p_load(dplyr, readr, data.table, tidyr, gt)
+setwd('C:/Data/Shared Folder/People/Rubyath/Data/Working files/Intermediate data/Period 1')
+std_cc1 <- read_csv2("std_cc1_co_cov.csv", show_col_types = FALSE)
+setwd('C:/Data/Shared Folder/People/Rubyath/Data/Working files/Intermediate data/Period 2')
+std_cc2 <- read_csv2("std_cc2_co_cov.csv", show_col_types = FALSE)
+setwd('C:/Data/Shared Folder/People/Rubyath/Data/Working files/Intermediate data/Period 3')
+std_cc3 <- read_csv2("std_cc3_co_cov.csv", show_col_types = FALSE)
+
+# Category for CCI
+std_cc1 <- std_cc1 %>% mutate(cci_cat = factor(case_when(cci_score <= 1 ~ "0-1", cci_score >= 2 & cci_score <= 4 ~ "2-4", cci_score >= 5 ~ ">=5", TRUE ~ NA_character_)))
+std_cc2 <- std_cc2 %>% mutate(cci_cat = factor(case_when(cci_score <= 1 ~ "0-1", cci_score >= 2 & cci_score <= 4 ~ "2-4", cci_score >= 5 ~ ">=5", TRUE ~ NA_character_)))
+std_cc3 <- std_cc3 %>% mutate(cci_cat = factor(case_when(cci_score <= 1 ~ "0-1", cci_score >= 2 & cci_score <= 4 ~ "2-4", cci_score >= 5 ~ ">=5", TRUE ~ NA_character_)))
+```
+# Continuous summary, pre-pandemic
+```{r}
+summary_cont1 <- std_cc1 %>% group_by(organism_inf_new) %>% summarise(across(.cols = c(age_year, days_of_stay), .fns = list(median = ~median(.x, na.rm = TRUE), q1 = ~quantile(.x, probs = 0.25, na.rm = TRUE), q3 = ~quantile(.x, probs = 0.75, na.rm = TRUE)), .names = "{.col}_{.fn}"), .groups = "drop")
+
+knitr::kable(summary_cont1)
+```
+# Continuous summary, pandemic
+```{r}
+summary_cont2 <- std_cc2 %>% group_by(organism_inf_new) %>% summarise(across(.cols = c(age_year, days_of_stay), .fns = list(median = ~median(.x, na.rm = TRUE), q1 = ~quantile(.x, probs = 0.25, na.rm = TRUE), q3 = ~quantile(.x, probs = 0.75, na.rm = TRUE)), .names = "{.col}_{.fn}"), .groups = "drop")
+
+knitr::kable(summary_cont2)
+```
+# Continuous summary, post-pandemic
+```{r}
+summary_cont3 <- std_cc3 %>% group_by(organism_inf_new) %>% summarise(across(.cols = c(age_year, days_of_stay), .fns = list(median = ~median(.x, na.rm = TRUE), q1 = ~quantile(.x, probs = 0.25, na.rm = TRUE), q3 = ~quantile(.x, probs = 0.75, na.rm = TRUE)), .names = "{.col}_{.fn}"), .groups = "drop")
+
+knitr::kable(summary_cont3)
+```
+# Categorical summary, pre-pandemic
+```{r}
+summary_cat1 <- std_cc1 %>% pivot_longer(cols = c(sex, education_level_recoded, mig_background, cci_cat, bac_coinf, icu, mech_ven, mort_30days), names_to = "variable", values_to = "category") %>% count(organism_inf_new, variable, category, name = "freq") %>% group_by(organism_inf_new, variable) %>% mutate(percentage = (freq/sum(freq)) * 100) %>% ungroup()
+
+head(summary_cat1)
+
+summary_cat1_table <- summary_cat1 %>% mutate(display_val = paste0(freq, " (", round(percentage, 2), "%)")) %>% select(organism_inf_new, variable, category, display_val) %>% pivot_wider(names_from = organism_inf_new, values_from = display_val)
+
+gt(summary_cat1_table)
+```
+# Categorical summary, pandemic
+```{r}
+summary_cat2 <- std_cc2 %>% pivot_longer(cols = c(sex, education_level_recoded, mig_background, cci_cat, bac_coinf, icu, mech_ven, mort_30days), names_to = "variable", values_to = "category") %>% count(organism_inf_new, variable, category, name = "freq") %>% group_by(organism_inf_new, variable) %>% mutate(percentage = (freq/sum(freq)) * 100) %>% ungroup()
+
+head(summary_cat2)
+
+summary_cat2_table <- summary_cat2 %>% mutate(display_val = paste0(freq, " (", round(percentage, 2), "%)")) %>% select(organism_inf_new, variable, category, display_val) %>% pivot_wider(names_from = organism_inf_new, values_from = display_val)
+
+gt(summary_cat2_table)
+```
+# Categorical summary, post-pandemic
+```{r}
+summary_cat3 <- std_cc3 %>% pivot_longer(cols = c(sex, education_level_recoded, mig_background, cci_cat, bac_coinf, icu, mech_ven, mort_30days), names_to = "variable", values_to = "category") %>% count(organism_inf_new, variable, category, name = "freq") %>% group_by(organism_inf_new, variable) %>% mutate(percentage = (freq/sum(freq)) * 100) %>% ungroup()
+
+head(summary_cat3)
+
+summary_cat3_table <- summary_cat3 %>% mutate(display_val = paste0(freq, " (", round(percentage, 2), "%)")) %>% select(organism_inf_new, variable, category, display_val) %>% pivot_wider(names_from = organism_inf_new, values_from = display_val)
+
+gt(summary_cat3_table)
+```

@@ -1,0 +1,149 @@
+---
+title: "30-day mortality, Pre-pandemic period"
+subtitle: "Model: Multivariable Logistic Regression"
+author: "Rubyath Binte Hasan"
+date: '2026-06-30'
+output: 
+  html_document:
+    toc: TRUE
+    toc_depth: 3
+    toc_float: TRUE
+    number_sections: TRUE
+---
+```{r}
+rm(list=ls())
+pacman::p_load(dplyr, readr, data.table, janitor, car, splines, VGAM, sandwich, lmtest, marginaleffects, gtsummary, ggplot2)
+print("RQ: Among adults, were there differences in 30-day all cause mortality of RSV, compared to SARS-Cov-2 and Influenza hospitalization episodes with these infections?")
+```
+# Study population:
+```{r}
+setwd('C:/Data/Shared Folder/People/Rubyath/Data/Working files/Intermediate data/Period 1')
+std_cc1 <- read_csv2("std_cc1_co_cov.csv")
+#Only two cases of SARS-Cov-2, removing them
+std_cc1 <- std_cc1 %>% filter(organism_inf_new != "SARS-CoV-2")
+#checking the % of repeated patients to account for multiple episodes from same patient
+#repetition around 5% or below -> robust clustered SE, GEE will struggle to converge
+repeat_pts <- get_dupes(std_cc1, lopnr)
+std_cc1 %>% summarise(pct_distinct = (n_distinct(repeat_pts$lopnr))/ (n_distinct(std_cc1$lopnr)) * 100)
+```
+# A priori setup:
+```{r}
+#Exposure: organism_inf_new -> Influenza A/B (reference group), RSV, SARS-CoV-2
+#Outcome: mort_30days
+#confounders/covariates: age_year, sex, education_level_recoded, mig_background, cci_cat, bac_coinf
+#interaction: virus*bac_coinf, virus*age
+#confounder and interactions are conceptualized a priori
+```
+# Data integrity and baseline checks:
+```{r}
+#checking missing data (covariates) for the need of imputation
+colSums(is.na(std_cc1))
+#categorizing CCI data as will be used modeled as categorical variable 
+std_cc1 <- std_cc1 %>% mutate(cci_cat = factor(case_when(cci_score <= 1 ~ "0-1", cci_score >= 2 & cci_score <= 4 ~ "2-4", cci_score >= 5 ~ ">=5", TRUE ~ NA_character_)))
+View(std_cc1)
+
+#categorical variables are factor and set reference group
+#continuous variables are numeric
+std_cc1$mort_30days <- relevel(factor(std_cc1$mort_30days), ref = "No")
+std_cc1$organism_inf_new <- relevel(factor(std_cc1$organism_inf_new), ref = "Influenza A/B")
+std_cc1$cci_cat <- relevel(factor(std_cc1$cci_cat), ref = "0-1")
+std_cc1$bac_coinf <- relevel(factor(std_cc1$bac_coinf), ref = "No")
+std_cc1$age_group <- relevel(factor(std_cc1$age_group), ref = "18-49 years")
+std_cc1$sex <- relevel(factor(std_cc1$sex), ref = "K")
+std_cc1$education_level_recoded <- relevel(factor(std_cc1$education_level_recoded), ref = "Primary")
+std_cc1$mig_background <- relevel(factor(std_cc1$mig_background), ref = "Swedish")
+
+std_cc1$age_year <- as.numeric(std_cc1$age_year)
+
+#checking zero cells and separation
+cat_covariates <- c("sex", "education_level_recoded", "mig_background", "cci_cat", "bac_coinf")
+lapply(std_cc1[cat_covariates], function(x) table(Covariate = x, Outcome = std_cc1$mort_30days))
+
+total_events <- sum(std_cc1$mort_30days == "Yes", na.rm = TRUE)
+cat("Total Events:", total_events, "\n")
+cat("Recommended max predictors (rule of 10):", floor(total_events/10), "\n")
+
+planned_covs <- c("sex", "education_level_recoded", "mig_background", "cci_cat", "bac_coinf")
+parameter_cost <- sapply(std_cc1[planned_covs], function(x) {if (is.numeric(x)) {return(1)} else if (is.factor(x) || is.character(x)) {return(length(unique(na.omit(x))) - 1)} else {return(NA)}})
+cost_breakdown <- data.frame(Covariates = names(parameter_cost), Point_Cost = parameter_cost)
+total_cost <- sum(parameter_cost)
+print(total_cost)
+#total_cost needs to be less than max predictors
+```
+# Pre-modelling assumption checking
+```{r}
+#checking linearity in the Logit
+std_cc1 <- std_cc1 %>% mutate(num_outcome = ifelse(mort_30days == "Yes", 1, 0))
+empirical_data <- std_cc1 %>% mutate(age_bin = ntile(age_year, 10)) %>% group_by(age_bin) %>% summarize(mean_age = mean(age_year, na.rm = TRUE), prob = mean(num_outcome, na.rm = TRUE), log_odds = log((prob + 0.01)/(1- prob + 0.01)))
+
+ggplot(empirical_data, aes(x = mean_age, y = log_odds)) + geom_point(size = 3) + geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") + geom_smooth(method = "loess", se = FALSE, color = "blue") + theme_minimal() + labs(title = "Age vs. Empirical log-odds", x = "Mean age (in deciles)", y = "log-odds of outcome")
+
+#box-tidwell test, significance means non-linear relationship, cons: sample size sensitive
+boxTidwell(num_outcome ~ age_year, data = std_cc1)
+```
+# Building the inference model:
+```{r}
+cc1_empty <- glm(mort_30days ~ organism_inf_new, family = binomial(link = "logit"), data = std_cc1)
+
+cc1_base_age_linear <- glm(mort_30days ~ organism_inf_new + age_year + sex, family = binomial(link = "logit"), data = std_cc1)
+
+cc1_full_age_linear <- glm(mort_30days ~ organism_inf_new + age_year + sex + education_level_recoded + mig_background + cci_cat + bac_coinf, family = binomial(link = "logit"), data = std_cc1)
+
+cc1_full_age_spline <- glm(mort_30days ~ organism_inf_new + ns(age_year, df = 4) + sex + education_level_recoded + mig_background + cci_cat + bac_coinf, family = binomial(link = "logit"), data = std_cc1)
+
+cc1_full_age_spline2 <- glm(mort_30days ~ organism_inf_new * ns(age_year, df = 4) + sex + education_level_recoded + mig_background + cci_cat + bac_coinf, family = binomial(link = "logit"), data = std_cc1)
+```
+# Model fitting
+```{r}
+#checking changes in estimates
+coef_age_linear <- coef(cc1_full_age_linear)["organism_inf_newRSV"]
+coef_age_spline <- coef(cc1_full_age_spline)["organism_inf_newRSV"]
+or_linear <- exp(coef_age_linear)
+or_spline <- exp(coef_age_spline)
+percent_change <- abs((or_spline - or_linear)/or_linear) * 100
+cat("--- change-in-estimate check for RSV ---\n")
+cat("OR (linear age):", round(or_linear, 3), "\n")
+cat("OR (spline age):", round(or_spline, 3), "\n")
+cat("-------------------------\n")
+cat("Absolute change:", round(percent_change, 2), "%\n")
+
+#Likelihood ratio test
+lrtest(cc1_base_age_linear, cc1_full_age_linear, cc1_full_age_spline, cc1_full_age_spline2)
+
+#AIC test
+AIC(cc1_base_age_linear, cc1_full_age_linear, cc1_full_age_spline, cc1_full_age_spline2)
+```
+# Post-diagnostic
+```{r}
+#multicoliniarity checking
+#to remove any covariates/confounder with a GVIF^2 > 5
+vif(cc1_full_age_linear)
+rm(cc1_full_age_linear)
+
+#checking overall model fit and influential observation
+library(DHARMa)
+sim_res <- simulateResiduals(fittedModel = cc1_full_age_spline, plot = TRUE)
+```
+
+# Result
+```{r}
+#OR and CI of empty model
+exp(cbind(OR = coef(cc1_empty), confint.default(cc1_empty)))
+
+#OR and robust SE of adjusted model
+robust_summary <- coeftest(cc1_full_age_spline, vcov = vcovHC(cc1_full_age_spline, type = "HC3"))
+print(robust_summary)
+robust_ci <- coefci(cc1_full_age_spline, vcov = vcovHC(cc1_full_age_spline, type = "HC3"))
+robust_results <- round(exp(cbind(OR = coef(cc1_full_age_spline), robust_ci)),3)
+print(robust_results)
+```
+# Calculating design effect
+```{r}
+#bootstrapping of Robust Cluster SE had converegnce issues (during ztnb), so checking how if clustering is really making any big difference
+pacman::p_load(lme4, performance)
+m <- nrow(std_cc1)/length(unique(std_cc1$lopnr))
+null_model <- glmer(mort_30days ~ 1 + (1 | lopnr), data = std_cc1, family = binomial)
+rho <- icc(null_model)$ICC_adjusted
+deff <- 1 + (m-1)*rho
+#apparently will not need robust clustered SE as deff is 1.01
+```
